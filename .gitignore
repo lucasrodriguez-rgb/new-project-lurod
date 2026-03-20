@@ -18,4 +18,6 @@ backtest_data/
 backtest_results.json
 equity_curve.csv
 live_paper_trading.json
+edge_trades.db
+models/
 logs/
