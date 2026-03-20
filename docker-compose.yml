@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  edge-trader:
+    build: .
+    container_name: polymarket-edge-trader
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./edge_trades.db:/app/edge_trades.db
+      - ./live_paper_trading.json:/app/live_paper_trading.json
+    restart: unless-stopped
+    command: ["python3", "-m", "polymarket_index.edge", "--duration", "720"]
+
+  paper-trader:
+    build: .
+    container_name: polymarket-paper-trader
+    env_file: .env
+    volumes:
+      - ./logs:/app/logs
+      - ./live_paper_trading.json:/app/live_paper_trading.json
+    restart: unless-stopped
+    command: ["python3", "-m", "polymarket_index.live", "--wallets", "500", "--duration", "720"]
+
+  telegram-bot:
+    build: .
+    container_name: polymarket-telegram-bot
+    env_file: .env
+    volumes:
+      - ./edge_trades.db:/app/edge_trades.db
+    restart: unless-stopped
+    command: ["python3", "-c", "import asyncio; from polymarket_index.bot.telegram_bot import TelegramBot; bot = TelegramBot(); asyncio.run(bot.start_polling())"]
+    profiles: ["telegram"]

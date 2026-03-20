@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Index — Dashboard</title>
+<style>
+  :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #e2e8f0; --muted: #94a3b8; --green: #22c55e; --red: #ef4444; --blue: #3b82f6; --purple: #a855f7; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+  .header { background: linear-gradient(135deg, #1e293b, #0f172a); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 20px; background: linear-gradient(90deg, var(--blue), var(--purple)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; padding: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .card h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
+  .big-number { font-size: 32px; font-weight: 700; }
+  .green { color: var(--green); }
+  .red { color: var(--red); }
+  .stat-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-label { color: var(--muted); }
+  .full-width { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px; border-bottom: 1px solid var(--border); }
+  tr:hover { background: rgba(255,255,255,0.03); }
+  .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+  .badge-win { background: rgba(34,197,94,0.15); color: var(--green); }
+  .badge-loss { background: rgba(239,68,68,0.15); color: var(--red); }
+  .badge-open { background: rgba(59,130,246,0.15); color: var(--blue); }
+  .chart-container { height: 200px; position: relative; background: rgba(0,0,0,0.2); border-radius: 8px; overflow: hidden; }
+  .chart-bar { position: absolute; bottom: 0; background: var(--blue); border-radius: 2px 2px 0 0; min-width: 3px; transition: height 0.3s; }
+  .chart-bar.negative { background: var(--red); }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
+  .tab { padding: 6px 16px; border-radius: 6px; font-size: 13px; cursor: pointer; background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  .tab.active { background: var(--blue); color: white; border-color: var(--blue); }
+  #last-update { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Polymarket Index</h1>
+  <div><span class="status-dot"></span> <span id="last-update">Connecting...</span></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Portfolio Value</h2>
+    <div id="total-value" class="big-number">$0.00</div>
+    <div id="total-pnl" style="font-size:16px;margin-top:4px">—</div>
+  </div>
+
+  <div class="card">
+    <h2>Trading Stats</h2>
+    <div class="stat-row"><span class="stat-label">Win Rate</span><span id="win-rate">—</span></div>
+    <div class="stat-row"><span class="stat-label">Open</span><span id="open-count">0</span></div>
+    <div class="stat-row"><span class="stat-label">Closed</span><span id="closed-count">0</span></div>
+    <div class="stat-row"><span class="stat-label">Cash</span><span id="cash">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Edge Trader</h2>
+    <div class="stat-row"><span class="stat-label">Total Trades</span><span id="edge-total">0</span></div>
+    <div class="stat-row"><span class="stat-label">Win Rate</span><span id="edge-wr">—</span></div>
+    <div class="stat-row"><span class="stat-label">P&L</span><span id="edge-pnl">—</span></div>
+    <div class="stat-row"><span class="stat-label">Open</span><span id="edge-open">0</span></div>
+  </div>
+
+  <div class="card full-width">
+    <h2>P&L History</h2>
+    <div class="chart-container" id="pnl-chart"></div>
+  </div>
+
+  <div class="card full-width">
+    <div class="tabs">
+      <div class="tab active" onclick="showTab('positions')">Positions</div>
+      <div class="tab" onclick="showTab('trades')">Recent Trades</div>
+      <div class="tab" onclick="showTab('leaderboard')">Wallet Leaderboard</div>
+    </div>
+    <div id="tab-positions">
+      <table><thead><tr><th>Market</th><th>Side</th><th>Size</th><th>Entry</th><th>P&L</th></tr></thead>
+      <tbody id="positions-body"></tbody></table>
+    </div>
+    <div id="tab-trades" style="display:none">
+      <table><thead><tr><th>Time</th><th>Market</th><th>Side</th><th>Size</th><th>P&L</th><th>Status</th></tr></thead>
+      <tbody id="trades-body"></tbody></table>
+    </div>
+    <div id="tab-leaderboard" style="display:none">
+      <table><thead><tr><th>Wallet</th><th>Signals</th><th>Copied</th></tr></thead>
+      <tbody id="leaderboard-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const pnlHistory = [];
+
+function showTab(name) {
+  document.querySelectorAll('[id^="tab-"]').forEach(el => el.style.display = 'none');
+  document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).style.display = 'block';
+  event.target.classList.add('active');
+}
+
+function fmt(n, decimals = 2) {
+  return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits: decimals, maximumFractionDigits: decimals});
+}
+
+function updateDashboard(data) {
+  const p = data.paper || {};
+  const e = data.edge || {};
+
+  document.getElementById('total-value').textContent = fmt(p.total_value || 0);
+  const pnl = p.total_pnl || 0;
+  const pnlPct = p.total_pnl_pct || 0;
+  const pnlEl = document.getElementById('total-pnl');
+  pnlEl.textContent = `${pnl >= 0 ? '+' : ''}${fmt(pnl)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`;
+  pnlEl.className = pnl >= 0 ? 'green' : 'red';
+
+  document.getElementById('win-rate').textContent = (p.win_rate || 0).toFixed(1) + '%';
+  document.getElementById('open-count').textContent = p.open_count || 0;
+  document.getElementById('closed-count').textContent = p.closed_count || 0;
+  document.getElementById('cash').textContent = fmt(p.cash || 0);
+
+  document.getElementById('edge-total').textContent = e.total_trades || 0;
+  document.getElementById('edge-wr').textContent = (e.win_rate || 0).toFixed(1) + '%';
+  document.getElementById('edge-pnl').textContent = fmt(e.total_pnl || 0);
+  document.getElementById('edge-open').textContent = e.open || 0;
+
+  document.getElementById('last-update').textContent = 'Live — ' + new Date().toLocaleTimeString();
+
+  pnlHistory.push(p.total_pnl || 0);
+  if (pnlHistory.length > 100) pnlHistory.shift();
+  renderChart();
+}
+
+function renderChart() {
+  const container = document.getElementById('pnl-chart');
+  container.innerHTML = '';
+  if (pnlHistory.length < 2) return;
+
+  const max = Math.max(...pnlHistory.map(Math.abs), 1);
+  const w = container.offsetWidth;
+  const h = container.offsetHeight;
+  const barW = Math.max(3, (w / pnlHistory.length) - 1);
+
+  pnlHistory.forEach((val, i) => {
+    const bar = document.createElement('div');
+    bar.className = 'chart-bar' + (val < 0 ? ' negative' : '');
+    const barH = Math.abs(val) / max * (h * 0.45);
+    bar.style.height = barH + 'px';
+    bar.style.width = barW + 'px';
+    bar.style.left = (i * (barW + 1)) + 'px';
+    if (val >= 0) {
+      bar.style.bottom = (h / 2) + 'px';
+    } else {
+      bar.style.bottom = (h / 2 - barH) + 'px';
+    }
+    container.appendChild(bar);
+  });
+}
+
+async function loadPositions() {
+  try {
+    const res = await fetch('/api/positions');
+    const data = await res.json();
+    const tbody = document.getElementById('positions-body');
+    const positions = [...(data.paper_positions || []), ...(data.edge_positions || [])];
+    tbody.innerHTML = positions.slice(0, 20).map(p => `
+      <tr>
+        <td>${(p.market_title || p.market || '').substring(0, 40)}</td>
+        <td>${p.side}</td>
+        <td>${fmt(p.size_usdc || p.size || 0)}</td>
+        <td>${(p.entry_price || 0).toFixed(3)}</td>
+        <td class="${(p.unrealized_pnl || 0) >= 0 ? 'green' : 'red'}">${fmt(p.unrealized_pnl || 0)}</td>
+      </tr>
+    `).join('');
+  } catch(e) {}
+}
+
+async function loadTrades() {
+  try {
+    const res = await fetch('/api/trades');
+    const data = await res.json();
+    const tbody = document.getElementById('trades-body');
+    tbody.innerHTML = (data.trades || []).slice(0, 20).map(t => `
+      <tr>
+        <td>${(t.timestamp || '').substring(11, 19)}</td>
+        <td>${(t.market || '').substring(0, 35)}</td>
+        <td>${t.side}</td>
+        <td>${fmt(t.size || 0)}</td>
+        <td class="${(t.pnl || 0) >= 0 ? 'green' : 'red'}">${t.pnl != null ? fmt(t.pnl) : '—'}</td>
+        <td><span class="badge badge-${t.status === 'open' ? 'open' : (t.pnl > 0 ? 'win' : 'loss')}">${t.status}</span></td>
+      </tr>
+    `).join('');
+  } catch(e) {}
+}
+
+async function loadLeaderboard() {
+  try {
+    const res = await fetch('/api/leaderboard');
+    const data = await res.json();
+    const tbody = document.getElementById('leaderboard-body');
+    tbody.innerHTML = (data.wallets || []).slice(0, 20).map(w => `
+      <tr>
+        <td><code>${w.wallet}</code></td>
+        <td>${w.signals}</td>
+        <td>${w.copied}</td>
+      </tr>
+    `).join('');
+  } catch(e) {}
+}
+
+// WebSocket connection
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'update') updateDashboard(data);
+  };
+  ws.onclose = () => setTimeout(connectWS, 3000);
+  ws.onerror = () => ws.close();
+}
+
+// Initial load
+connectWS();
+setInterval(loadPositions, 10000);
+setInterval(loadTrades, 15000);
+setInterval(loadLeaderboard, 30000);
+loadPositions();
+loadTrades();
+loadLeaderboard();
+</script>
+</body>
+</html>
