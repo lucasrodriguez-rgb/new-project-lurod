@@ -31,6 +31,10 @@ polymarket_index/
 ├── executor/
 │   ├── trade_builder.py         # Position sizing + order construction
 │   └── order_manager.py         # CLOB order placement + lifecycle
+├── backtest/
+│   ├── data_collector.py        # Fetch + cache historical data from Gamma API
+│   ├── engine.py                # Walk-forward backtest engine
+│   └── runner.py                # CLI entry point with result reporting
 ├── db/
 │   ├── models.py                # SQLAlchemy async models (5 tables)
 │   └── queries.py               # Typed query functions
@@ -71,10 +75,70 @@ Raw signals must pass all 7 checks:
 | Crowding | < 3 top wallets already hold the same position |
 | Wallet tenure | Wallet has been in index > 48 hours |
 
-## Getting Started
+## Backtesting
+
+The backtest module lets you validate the strategy against real historical data **before risking any capital**. No API keys required — it uses the public Gamma API.
+
+### Quick Start
 
 ```bash
-# Clone and install
+pip install -r requirements.txt
+
+# Step 1: Fetch and cache historical trade data from top wallets
+python3 -m polymarket_index.backtest.runner collect
+
+# Step 2: Run the backtest
+python3 -m polymarket_index.backtest.runner run
+```
+
+### Or combine both steps:
+
+```bash
+python3 -m polymarket_index.backtest.runner full
+```
+
+### Customize Parameters
+
+```bash
+# Use specific wallets instead of the leaderboard
+python3 -m polymarket_index.backtest.runner full \
+  --wallets 0xabc123...,0xdef456...
+
+# Adjust strategy parameters
+python3 -m polymarket_index.backtest.runner run \
+  --capital 50000 \
+  --top-n 10 \
+  --lookback 60 \
+  --trade-pct 0.02
+
+# Set date range
+python3 -m polymarket_index.backtest.runner run \
+  --start 2025-06-01 \
+  --end 2025-09-01
+
+# Export results
+python3 -m polymarket_index.backtest.runner run \
+  --output results.json \
+  --csv equity_curve.csv
+```
+
+### What the Backtest Does
+
+1. **Scores wallets** using only data from a rolling lookback window (no lookahead bias)
+2. **Walks forward day-by-day** through the trading window
+3. **Detects trades** from the top-N scored wallets
+4. **Validates** against crowding limits and position constraints
+5. **Simulates copy-trades** with dynamic position sizing
+6. **Resolves positions** when market outcomes are known
+7. **Reports** total return, Sharpe ratio, max drawdown, win rate, profit factor, and daily equity curve
+
+Data is cached locally in `backtest_data/` so you only hit the API once. Subsequent runs are instant.
+
+## Live System
+
+### Getting Started
+
+```bash
 pip install -r requirements.txt
 
 # Configure
@@ -87,6 +151,16 @@ python3 -m polymarket_index.main
 # Run with live order placement
 python3 -m polymarket_index.main --live
 ```
+
+### What You Need
+
+| Credential | Required For | How to Get |
+|------------|-------------|------------|
+| None | Backtesting | Just run it — uses public API |
+| `POLYGON_RPC_URL` | On-chain wallet discovery | Free tier from [Alchemy](https://www.alchemy.com/) or [Infura](https://www.infura.io/) |
+| `POLYMARKET_API_KEY` | Live order placement | [Polymarket CLOB docs](https://docs.polymarket.com/) |
+| `POLYMARKET_SECRET` | Live order placement | Same as above |
+| `POLYMARKET_PASSPHRASE` | Live order placement | Same as above |
 
 ## Configuration
 
