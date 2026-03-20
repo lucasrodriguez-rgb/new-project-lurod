@@ -65,6 +65,19 @@ class Settings(BaseSettings):
     api_max_retries: int = 5
     api_base_backoff_seconds: float = 1.0
 
+    # ── Edge trading ────────────────────────────────────────────────────
+    min_ev_threshold: float = 0.03
+    min_market_volume: float = 5_000.0
+    min_order_book_depth: float = 500.0
+    max_position_per_market: float = 500.0
+    edge_poll_interval_seconds: int = 10
+    crypto_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"])
+
+    # ── Telegram ────────────────────────────────────────────────────────
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_enabled: bool = False
+
     # ── Seed wallets ────────────────────────────────────────────────────
     seed_wallets: list[str] = Field(default_factory=list)
 
