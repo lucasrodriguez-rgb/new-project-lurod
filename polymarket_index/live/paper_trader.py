@@ -77,6 +77,8 @@ class LivePaperTrader:
         self._cycle_count = 0
         self._start_time = time.monotonic()
         self._running = False
+        self._pnl_history: list[dict] = []  # [{time, value, pnl, pnl_pct, cash, open, closed}]
+        self._last_pnl = 0.0
 
     async def run(self) -> None:
         self._running = True
@@ -215,6 +217,24 @@ class LivePaperTrader:
             await self._process_signal(wallet_addr, trade, rank)
 
         await self._update_open_positions()
+
+        # Track P&L every cycle
+        p = self._portfolio
+        now_str = dt.datetime.now(dt.timezone.utc).strftime("%H:%M:%S")
+        cycle_pnl_change = p.total_pnl - self._last_pnl
+        self._pnl_history.append({
+            "time": now_str,
+            "value": round(p.total_value, 2),
+            "pnl": round(p.total_pnl, 2),
+            "pnl_pct": round(p.total_pnl_pct, 2),
+            "change": round(cycle_pnl_change, 2),
+            "cash": round(p.cash, 2),
+            "open": len(p.open_positions),
+            "closed": len(p.closed_positions),
+            "wins": p.win_count,
+            "losses": p.loss_count,
+        })
+        self._last_pnl = p.total_pnl
 
         if self._cycle_count % 60 == 0:
             self._score_all_wallets()
@@ -496,84 +516,122 @@ class LivePaperTrader:
         p = self._portfolio
         elapsed = time.monotonic() - self._start_time
         elapsed_h = elapsed / 3600
+        elapsed_m = elapsed / 60
         remaining_h = max(0, self._duration - elapsed_h)
 
         os.system("clear" if os.name != "nt" else "cls")
 
-        pnl_sign = "+" if p.total_pnl >= 0 else ""
-        rpnl_sign = "+" if p.realized_pnl >= 0 else ""
+        pnl = p.total_pnl
+        pnl_pct = p.total_pnl_pct
+        rpnl = p.realized_pnl
+        upnl = pnl - rpnl
+        last_change = self._pnl_history[-1]["change"] if self._pnl_history else 0
+        change_arrow = "^" if last_change > 0 else ("v" if last_change < 0 else "=")
+
+        deployed = p.initial_capital - p.cash
+        deployed_pct = (deployed / p.initial_capital * 100) if p.initial_capital > 0 else 0
 
         print("=" * 70)
         print("  POLYMARKET LIVE PAPER TRADER")
+        print(f"  {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
         print("=" * 70)
-        print(f"  Started: {p.started_at[:19]}Z")
-        print(f"  Running: {elapsed_h:.1f}h / {self._duration:.0f}h ({remaining_h:.1f}h left)")
-        print(f"  Cycle:   #{self._cycle_count} (every {self._poll_interval}s)")
-        print(f"  Wallets: {len(self._wallet_scores)} scored / {len(self._wallet_addresses)} tracked")
+
+        # P&L headline
+        pnl_color = "\033[92m" if pnl >= 0 else "\033[91m"
+        reset = "\033[0m"
+        print(f"  {pnl_color}P&L: ${pnl:+,.2f} ({pnl_pct:+.2f}%) {change_arrow}{reset}")
         print()
-        print(f"  {'='*50}")
-        print(f"  PORTFOLIO")
-        print(f"  {'='*50}")
-        print(f"  Initial:      ${p.initial_capital:>12,.2f}")
-        print(f"  Current:      ${p.total_value:>12,.2f}  ({pnl_sign}{p.total_pnl_pct:.2f}%)")
-        print(f"  Cash:         ${p.cash:>12,.2f}")
-        print(f"  Unrealized:   ${p.total_pnl - p.realized_pnl:>12,.2f}")
-        print(f"  Realized:     ${rpnl_sign}{p.realized_pnl:>11,.2f}")
+
+        # Portfolio
+        print(f"  Initial:       ${p.initial_capital:>10,.2f}")
+        print(f"  Current Value: ${p.total_value:>10,.2f}")
+        print(f"  Cash:          ${p.cash:>10,.2f}")
+        print(f"  Deployed:      ${deployed:>10,.2f}  ({deployed_pct:.0f}%)")
+        print(f"  Unrealized:    ${upnl:>+10,.2f}")
+        print(f"  Realized:      ${rpnl:>+10,.2f}")
         print()
-        print(f"  {'='*50}")
-        print(f"  TRADING STATS")
-        print(f"  {'='*50}")
-        print(f"  Open Positions: {len(p.open_positions)}")
-        print(f"  Closed Trades:  {len(p.closed_positions)}")
-        print(f"  Win Rate:       {p.win_rate:.1f}% ({p.win_count}W / {p.loss_count}L)")
-        print(f"  Profit Factor:  {p.profit_factor:.2f}")
-        print(f"  Signals Seen:   {len(p.signals_log)}")
+
+        # Stats
         copied = sum(1 for s in p.signals_log if s.action == "COPY")
         skipped = sum(1 for s in p.signals_log if s.action == "SKIP")
-        print(f"  Copied/Skipped: {copied} / {skipped}")
+        print(f"  Open: {len(p.open_positions)}  |  Closed: {len(p.closed_positions)}  "
+              f"|  Win Rate: {p.win_rate:.1f}% ({p.win_count}W/{p.loss_count}L)  "
+              f"|  PF: {p.profit_factor:.2f}")
+        print(f"  Signals: {len(p.signals_log)} ({copied} copied, {skipped} skipped)  "
+              f"|  Cycle: #{self._cycle_count}  |  {elapsed_m:.0f}m / {self._duration*60:.0f}m")
 
+        # P&L timeline (last 20 snapshots)
+        if len(self._pnl_history) > 1:
+            print()
+            print(f"  --- P&L TIMELINE (last 20 updates) ---")
+            recent = self._pnl_history[-20:]
+            for snap in recent:
+                chg = snap["change"]
+                chg_color = "\033[92m" if chg > 0 else ("\033[91m" if chg < 0 else "\033[90m")
+                bar_len = min(int(abs(chg) / 2), 20) if chg != 0 else 0
+                bar = "+" * bar_len if chg > 0 else "-" * bar_len
+                print(
+                    f"  {snap['time']}  ${snap['value']:>10,.2f}  "
+                    f"P&L ${snap['pnl']:>+8,.2f} ({snap['pnl_pct']:>+6.2f}%)  "
+                    f"{chg_color}{chg:>+7.2f} {bar}{reset}  "
+                    f"[{snap['open']}o/{snap['closed']}c]"
+                )
+
+        # Open positions
         if p.open_positions:
             print()
-            print(f"  {'='*50}")
-            print(f"  OPEN POSITIONS (top 10)")
-            print(f"  {'='*50}")
-            sorted_pos = sorted(p.open_positions, key=lambda x: abs(x.unrealized_pnl), reverse=True)
-            for pos in sorted_pos[:10]:
-                upnl_sign = "+" if pos.unrealized_pnl >= 0 else ""
+            print(f"  --- OPEN POSITIONS ({len(p.open_positions)}) ---")
+            sorted_pos = sorted(p.open_positions, key=lambda x: x.unrealized_pnl, reverse=True)
+            for pos in sorted_pos[:12]:
+                upnl_c = "\033[92m" if pos.unrealized_pnl >= 0 else "\033[91m"
+                age_str = ""
+                try:
+                    opened = dt.datetime.fromisoformat(pos.opened_at)
+                    age_m = (dt.datetime.now(dt.timezone.utc) - opened).total_seconds() / 60
+                    if age_m < 60:
+                        age_str = f"{age_m:.0f}m"
+                    else:
+                        age_str = f"{age_m/60:.1f}h"
+                except Exception:
+                    pass
                 print(
                     f"  {pos.side:3s} ${pos.size_usdc:>7.2f} @ {pos.entry_price:.3f} "
-                    f"→ {upnl_sign}${pos.unrealized_pnl:.2f}  "
-                    f"| {pos.market_title[:35]}"
+                    f"now {pos.current_price:.3f} "
+                    f"{upnl_c}${pos.unrealized_pnl:>+8.2f}{reset}  "
+                    f"{age_str:>5s}  {pos.market_title[:30]}"
                 )
+            if len(p.open_positions) > 12:
+                print(f"  ... and {len(p.open_positions) - 12} more")
 
-        recent_closed = p.closed_positions[-5:]
+        # Recent closed trades
+        recent_closed = p.closed_positions[-8:]
         if recent_closed:
             print()
-            print(f"  {'='*50}")
-            print(f"  RECENT TRADES")
-            print(f"  {'='*50}")
+            print(f"  --- RECENT CLOSED TRADES ---")
             for c in reversed(recent_closed):
-                icon = "W" if c.won else "L"
+                c_color = "\033[92m" if c.won else "\033[91m"
+                icon = "WIN " if c.won else "LOSS"
                 print(
-                    f"  [{icon}] {c.side:3s} ${c.size_usdc:>7.2f} "
-                    f"→ ${c.pnl:+.2f} ({c.pnl_pct:+.1f}%) "
-                    f"| {c.market_title[:30]}"
+                    f"  {c_color}[{icon}]{reset} {c.side:3s} ${c.size_usdc:>7.2f} "
+                    f"@ {c.entry_price:.3f} -> {c.exit_price:.3f}  "
+                    f"{c_color}${c.pnl:>+8.2f} ({c.pnl_pct:>+6.1f}%){reset}  "
+                    f"{c.hold_time_minutes:.0f}m  {c.market_title[:25]}"
                 )
 
-        recent_signals = [s for s in p.signals_log[-10:] if s.action == "COPY"]
-        if recent_signals:
+        # Last few copy signals
+        recent_copies = [s for s in p.signals_log[-20:] if s.action == "COPY"][-5:]
+        if recent_copies:
             print()
-            print(f"  {'='*50}")
-            print(f"  RECENT SIGNALS")
-            print(f"  {'='*50}")
-            for s in reversed(recent_signals[-5:]):
+            print(f"  --- LATEST COPIES ---")
+            for s in reversed(recent_copies):
                 print(
-                    f"  [{s.action}] rank={s.wallet_rank:2d} {s.side:3s} "
-                    f"@ {s.price:.3f} ${s.size_usdc:.0f} "
-                    f"| {s.market_title[:30]}"
+                    f"  {s.timestamp[11:19]}  rank={s.wallet_rank:>3d}  "
+                    f"{s.side:3s} @ {s.price:.3f}  ${s.size_usdc:>7.0f}  "
+                    f"{s.market_title[:30]}"
                 )
 
         print()
+        print(f"  Wallets: {len(self._wallet_scores)} scored / {len(self._wallet_addresses)} tracked")
         print(f"  Snapshot: {SNAPSHOT_PATH}")
         print("=" * 70)
 
