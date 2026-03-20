@@ -145,7 +145,7 @@ class LivePaperTrader:
         if not self._wallet_addresses:
             raise RuntimeError("No wallets found on leaderboard")
 
-        logger.info("Loading recent trades for scoring (keeping seen window small)...")
+        logger.info("Loading recent trades for scoring + marking ALL existing as seen...")
         sem = asyncio.Semaphore(8)
         loaded = 0
 
@@ -155,8 +155,8 @@ class LivePaperTrader:
                 try:
                     trades = await self._api.get_trades(addr, limit=100, offset=0)
                     self._wallet_trades[addr] = [self._trade_to_dict(t) for t in trades]
-                    # Only mark the LAST 3 trades as seen — everything else can trigger copies
-                    for t in trades[:3]:
+                    # Mark ALL existing trades as seen — we only want truly NEW trades
+                    for t in trades:
                         if t.id:
                             self._seen_tx_hashes.add(t.id)
                     loaded += 1
@@ -166,7 +166,7 @@ class LivePaperTrader:
                     logger.debug("Failed to load {}: {}", addr[:10], exc)
 
         await asyncio.gather(*[_load(a) for a in self._wallet_addresses])
-        logger.info("Loaded {} wallets ({} seen hashes — kept small for more signals)",
+        logger.info("Loaded {} wallets ({} existing trades marked as seen)",
                      len(self._wallet_trades), len(self._seen_tx_hashes))
 
         self._score_all_wallets()
@@ -276,16 +276,32 @@ class LivePaperTrader:
             )
 
     def _validate_signal(self, trade: TradeRecord, rank: int) -> str:
-        if trade.price <= 0.02:
-            return f"price too low ({trade.price:.3f})"
-        if trade.price >= 0.99:
-            return f"price too high ({trade.price:.3f})"
+        # Reject already-resolved markets (price at 0 or 1 = already settled)
+        if trade.price <= 0.03:
+            return f"price too low / likely resolved ({trade.price:.3f})"
+        if trade.price >= 0.97:
+            return f"price too high / likely resolved ({trade.price:.3f})"
+
+        # Reject old trades — only copy trades from the last 5 minutes
+        if trade.timestamp:
+            try:
+                ts_str = trade.timestamp
+                if isinstance(ts_str, str):
+                    trade_time = dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                else:
+                    trade_time = dt.datetime.fromtimestamp(float(ts_str), tz=dt.timezone.utc)
+
+                age_seconds = (dt.datetime.now(dt.timezone.utc) - trade_time).total_seconds()
+                if age_seconds > 300:
+                    return f"trade too old ({age_seconds:.0f}s > 300s)"
+            except Exception:
+                pass
 
         same_market_same_side = sum(
             1 for p in self._portfolio.open_positions
             if p.market_id == trade.market_id and p.side == trade.side
         )
-        if same_market_same_side >= 5:
+        if same_market_same_side >= 3:
             return f"already have {same_market_same_side} same-side positions"
 
         if len(self._portfolio.open_positions) >= 200:
@@ -297,12 +313,36 @@ class LivePaperTrader:
         return ""
 
     async def _update_open_positions(self) -> None:
-        """Check if any markets have resolved and close positions."""
+        """
+        Check open positions by re-fetching recent activity from the wallets
+        that originated each trade. Also checks for resolved markets.
+        Auto-closes positions older than 24h at their last known price.
+        """
         if not self._portfolio.open_positions:
             return
 
-        market_ids = list({p.market_id for p in self._portfolio.open_positions})
+        now = dt.datetime.now(dt.timezone.utc)
 
+        # 1. Auto-close positions older than 24h at current mark
+        for pos in list(self._portfolio.open_positions):
+            try:
+                opened = dt.datetime.fromisoformat(pos.opened_at)
+                age_hours = (now - opened).total_seconds() / 3600
+                if age_hours > 24:
+                    exit_price = pos.current_price if pos.current_price > 0 else pos.entry_price
+                    closed = self._portfolio.close_position(pos.id, exit_price)
+                    if closed:
+                        icon = "W" if closed.won else "L"
+                        logger.info(
+                            "AUTO-CLOSE [{}] {} | {} ${:.2f} -> ${:+.2f} ({:+.1f}%) (>24h)",
+                            icon, closed.market_title[:30], closed.side,
+                            closed.size_usdc, closed.pnl, closed.pnl_pct,
+                        )
+            except Exception:
+                pass
+
+        # 2. Try to check a few markets for resolution via Gamma API
+        market_ids = list({p.market_id for p in self._portfolio.open_positions})
         for mid in market_ids[:3]:
             try:
                 market = await self._api.get_market_by_id(mid)
@@ -310,23 +350,18 @@ class LivePaperTrader:
                     continue
 
                 if market.closed and market.outcome_prices:
-                    yes_price = market.outcome_prices.get("Yes", market.outcome_prices.get("yes", 0))
-                    no_price = market.outcome_prices.get("No", market.outcome_prices.get("no", 0))
-
                     for pos in list(self._portfolio.open_positions):
                         if pos.market_id != mid:
                             continue
 
                         exit_price = None
-                        if yes_price > 0.9:
+                        yes_p = market.outcome_prices.get("Yes", market.outcome_prices.get("yes", 0))
+                        no_p = market.outcome_prices.get("No", market.outcome_prices.get("no", 0))
+
+                        if yes_p > 0.9:
                             exit_price = 1.0 if pos.side.upper() in ("YES", "BUY") else 0.0
-                        elif no_price > 0.9:
+                        elif no_p > 0.9:
                             exit_price = 0.0 if pos.side.upper() in ("YES", "BUY") else 1.0
-                        else:
-                            for _, price in market.outcome_prices.items():
-                                if price > 0.9:
-                                    exit_price = 1.0 if pos.side.upper() in ("YES", "BUY") else 0.0
-                                    break
 
                         if exit_price is not None:
                             closed = self._portfolio.close_position(pos.id, exit_price)
