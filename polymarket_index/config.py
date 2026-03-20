@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     # ── Endpoints ───────────────────────────────────────────────────────
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     clob_api_url: str = "https://clob.polymarket.com"
+    data_api_url: str = "https://data-api.polymarket.com"
     polymarket_leaderboard_url: str = "https://polymarket.com/leaderboard"
 
     # ── Polygon RPC ─────────────────────────────────────────────────────

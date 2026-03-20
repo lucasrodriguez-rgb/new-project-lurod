@@ -17,6 +17,13 @@ from polymarket_index.api.polymarket import PolymarketClient, TradeRecord, Marke
 
 DATA_DIR = Path("backtest_data")
 
+FALLBACK_TOP_WALLETS = [
+    "0x56687bf447db6ffa42ffe2204a05edaa20f55839",  # Theo4
+    "0xa61ef8773ec2e821962306ca87d4b57e39ff0abd",  # risk-manager
+    "0x204f72f35326db932158cba6adff0b9a1da95e14",  # swisstony
+    "0xe90bec87d9ef430f27f9dcfe72c34b76967d5da2",  # gmanas
+]
+
 
 @dataclass
 class WalletHistory:
@@ -130,8 +137,14 @@ class DataCollector:
                 )
                 return data["addresses"]
 
-        logger.info("Fetching leaderboard...")
+        logger.info("Fetching leaderboard from Data API...")
         addresses = await self._api.scrape_leaderboard(limit=limit)
+
+        if not addresses:
+            logger.warning("Leaderboard returned 0 wallets, using fallback seed list")
+            addresses = list(FALLBACK_TOP_WALLETS)
+
+        addresses = [a for a in addresses if a and len(a) >= 10]
 
         cache_path.write_text(
             json.dumps(

@@ -14,3 +14,7 @@ env/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+backtest_data/
+backtest_results.json
+equity_curve.csv
+logs/

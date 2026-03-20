@@ -23,10 +23,11 @@ class BacktestTrade:
     timestamp: dt.datetime
     wallet_address: str
     market_id: str
-    side: str
-    size: float
+    side: str          # YES or NO
+    size: float        # USDC value
     price: float
-    outcome: str | None
+    outcome: str | None  # resolved outcome name from API (e.g. "Yes", "No", "Dodgers")
+    is_winner: bool | None = None  # derived: did this trade's side win?
 
 
 @dataclass
@@ -198,7 +199,10 @@ class BacktestEngine:
                 )
 
                 size_pct = self._compute_size(wallet_rank, trade, top_addresses)
-                size_usdc = self._portfolio_value() * size_pct
+                size_usdc = min(
+                    self._portfolio_value() * size_pct,
+                    self._initial_capital * size_pct * 5,
+                )
 
                 if size_usdc < 1.0 or size_usdc > self._portfolio_cash:
                     continue
@@ -260,15 +264,21 @@ class BacktestEngine:
                 ts = _parse_ts(t.get("timestamp", ""))
                 if ts is None:
                     continue
+
+                side = t.get("side", "").upper()
+                outcome = t.get("outcome")
+                is_winner = _determine_win(side, outcome)
+
                 self._all_trades.append(
                     BacktestTrade(
                         timestamp=ts,
                         wallet_address=addr.lower(),
                         market_id=t.get("market_id", ""),
-                        side=t.get("side", "").upper(),
+                        side=side,
                         size=float(t.get("size", 0)),
                         price=float(t.get("price", 0)),
-                        outcome=t.get("outcome"),
+                        outcome=outcome,
+                        is_winner=is_winner,
                     )
                 )
         self._all_trades.sort(key=lambda t: t.timestamp)
@@ -297,20 +307,26 @@ class BacktestEngine:
             daily_pnl: dict[str, float] = {}
 
             for t in trades_in_window:
-                capital = float(t.get("size", 0)) * float(t.get("price", 0))
+                size_val = float(t.get("size", 0))
+                price_val = float(t.get("price", 0))
+                capital = size_val if size_val > 0 else 0
+                if capital <= 0:
+                    continue
                 total_capital += capital
                 markets.add(t.get("market_id", ""))
 
+                side = t.get("side", "").upper()
                 outcome = t.get("outcome")
-                if outcome == "win":
-                    price = float(t.get("price", 0.5))
-                    pnl = capital * (1.0 / price - 1.0) if price > 0 else 0
+                won = _determine_win(side, outcome)
+
+                if won is True:
+                    pnl = (capital / price_val - capital) if price_val > 0 else 0
                     total_pnl += pnl
                     wins += 1
                     resolved += 1
                     day = t.get("timestamp", "")[:10]
                     daily_pnl[day] = daily_pnl.get(day, 0) + pnl
-                elif outcome == "loss":
+                elif won is False:
                     total_pnl -= capital
                     resolved += 1
                     day = t.get("timestamp", "")[:10]
@@ -427,17 +443,20 @@ class BacktestEngine:
         still_open: list[CopyTradeSim] = []
 
         for pos in self._open_positions:
-            if pos.outcome in ("win", "loss"):
-                if pos.outcome == "win":
-                    payout = pos.size_usdc / pos.entry_price
-                    pos.pnl = payout - pos.size_usdc
-                    pos.exit_price = 1.0
-                else:
-                    pos.pnl = -pos.size_usdc
-                    pos.exit_price = 0.0
+            won = _determine_win(pos.side, pos.outcome)
 
+            if won is True:
+                payout = pos.size_usdc / pos.entry_price if pos.entry_price > 0 else pos.size_usdc
+                pos.pnl = payout - pos.size_usdc
+                pos.exit_price = 1.0
                 pos.resolved = True
                 self._portfolio_cash += pos.size_usdc + pos.pnl
+                self._closed_positions.append(pos)
+            elif won is False:
+                pos.pnl = -pos.size_usdc
+                pos.exit_price = 0.0
+                pos.resolved = True
+                self._portfolio_cash += 0
                 self._closed_positions.append(pos)
             else:
                 still_open.append(pos)
@@ -548,3 +567,40 @@ def _trade_in_range(
     if ts is None:
         return False
     return start <= ts.date() <= end
+
+
+def _determine_win(side: str, outcome: str | None) -> bool | None:
+    """
+    Determine if a trade won based on the side (YES/NO/BUY/SELL) and
+    the resolved outcome name from the Polymarket API.
+
+    The API returns the winning outcome's name — for binary markets this is
+    "Yes" or "No". For multi-outcome markets it's the winner name
+    (e.g. "Dodgers", "Heat").
+
+    Returns True (win), False (loss), or None (unresolved / unknown).
+    """
+    if not outcome:
+        return None
+
+    side_upper = side.upper()
+    outcome_upper = outcome.upper().strip()
+
+    if side_upper in ("YES", "BUY"):
+        if outcome_upper == "YES":
+            return True
+        elif outcome_upper == "NO":
+            return False
+        else:
+            # Multi-outcome market — we can't reliably determine win/loss
+            # without knowing which specific token was held.
+            return None
+    elif side_upper in ("NO", "SELL"):
+        if outcome_upper == "NO":
+            return True
+        elif outcome_upper == "YES":
+            return False
+        else:
+            return None
+
+    return None

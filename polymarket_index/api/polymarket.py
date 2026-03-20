@@ -285,11 +285,11 @@ class PolymarketClient:
             category=m.get("category", ""),
         )
 
-    # ── Gamma API: Positions ────────────────────────────────────────────
+    # ── Data API: Positions ─────────────────────────────────────────────
 
     async def get_positions(self, address: str) -> list[Position]:
-        url = f"{settings.gamma_api_url}/positions"
-        params = {"user": address.lower()}
+        url = f"{settings.data_api_url}/positions"
+        params: dict[str, Any] = {"user": address.lower(), "limit": 500}
         data = await self._request("GET", url, params=params)
 
         if not isinstance(data, list):
@@ -298,16 +298,18 @@ class PolymarketClient:
         return [
             Position(
                 market_id=str(p.get("conditionId", p.get("market_id", ""))),
-                market_slug=p.get("market_slug", ""),
+                market_slug=p.get("slug", p.get("market_slug", "")),
                 outcome=p.get("outcome", ""),
-                size=float(p.get("size", 0)),
-                avg_price=float(p.get("avgPrice", p.get("avg_price", 0))),
-                current_value=float(p.get("currentValue", p.get("value", 0))),
+                size=float(p.get("size", p.get("tokens", 0)) or 0),
+                avg_price=float(p.get("avgPrice", p.get("avg_price", 0)) or 0),
+                current_value=float(p.get("currentValue", p.get("value", 0)) or 0),
             )
             for p in data
         ]
 
-    # ── Gamma API: Trade history ────────────────────────────────────────
+    # ── Data API: Trade history ──────────────────────────────────────────
+
+    MAX_ACTIVITY_OFFSET = 3000
 
     async def get_trades(
         self,
@@ -315,42 +317,76 @@ class PolymarketClient:
         limit: int = 100,
         offset: int = 0,
     ) -> list[TradeRecord]:
-        url = f"{settings.gamma_api_url}/trades"
+        if offset >= self.MAX_ACTIVITY_OFFSET:
+            return []
+
+        url = f"{settings.data_api_url}/activity"
         params: dict[str, Any] = {
             "user": address.lower(),
-            "limit": limit,
+            "limit": min(limit, 500),
             "offset": offset,
+            "type": "TRADE",
+            "sortBy": "TIMESTAMP",
+            "sortDirection": "DESC",
         }
         data = await self._request("GET", url, params=params)
 
         if not isinstance(data, list):
-            data = data.get("data", data.get("trades", []))
+            data = data.get("data", data.get("history", data.get("activity", [])))
 
-        return [
-            TradeRecord(
-                id=str(t.get("id", "")),
-                market_id=str(t.get("conditionId", t.get("market_id", ""))),
-                market_slug=t.get("market_slug", ""),
-                side=t.get("side", t.get("outcome", "")).upper(),
-                size=float(t.get("size", t.get("amount", 0))),
-                price=float(t.get("price", 0)),
-                timestamp=t.get("timestamp", t.get("created_at", "")),
-                outcome=t.get("tradeOutcome"),
+        results: list[TradeRecord] = []
+        for idx, t in enumerate(data):
+            tx_hash = t.get("transactionHash", "")
+            trade_id = tx_hash or f"{address[:10]}-{offset + idx}"
+
+            market_id = str(t.get("conditionId", ""))
+
+            side = (t.get("side", "") or "").upper()
+            if side == "BUY":
+                side = "YES"
+            elif side == "SELL":
+                side = "NO"
+            elif not side:
+                outcome_idx = t.get("outcomeIndex")
+                side = "YES" if outcome_idx == 0 else "NO"
+
+            size_val = float(t.get("size", 0) or 0)
+            price_val = float(t.get("price", 0) or 0)
+            usdc_size = float(t.get("usdcSize", 0) or 0)
+
+            ts = t.get("timestamp", "")
+            if isinstance(ts, (int, float)):
+                import datetime as _dt
+                ts = _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).isoformat()
+
+            results.append(
+                TradeRecord(
+                    id=trade_id,
+                    market_id=market_id,
+                    market_slug=t.get("slug", ""),
+                    side=side or "YES",
+                    size=usdc_size if usdc_size > 0 else (size_val * price_val),
+                    price=price_val,
+                    timestamp=str(ts),
+                    outcome=t.get("outcome"),
+                )
             )
-            for t in data
-        ]
+        return results
 
     async def get_all_trades(self, address: str) -> list[TradeRecord]:
         all_trades: list[TradeRecord] = []
         offset = 0
-        while True:
-            batch = await self.get_trades(address, limit=100, offset=offset)
+        page_size = 500
+        while offset < self.MAX_ACTIVITY_OFFSET:
+            batch = await self.get_trades(address, limit=page_size, offset=offset)
             if not batch:
                 break
             all_trades.extend(batch)
-            if len(batch) < 100:
+            if len(batch) < page_size:
                 break
-            offset += 100
+            offset += len(batch)
+
+        logger.info("Fetched {} trades for {}", len(all_trades), address[:10])
         return all_trades
 
     # ── CLOB API: Order book ────────────────────────────────────────────
@@ -416,27 +452,55 @@ class PolymarketClient:
         url = f"{settings.clob_api_url}/order/{order_id}"
         return await self._request("DELETE", url, auth=True)
 
-    # ── Leaderboard scraping ────────────────────────────────────────────
+    # ── Leaderboard (Data API) ──────────────────────────────────────────
 
-    async def scrape_leaderboard(self, limit: int = 100) -> list[str]:
+    async def scrape_leaderboard(
+        self,
+        limit: int = 50,
+        time_period: str = "ALL",
+        order_by: str = "PNL",
+    ) -> list[str]:
         """
-        Fetch top wallet addresses from the Polymarket leaderboard.
-        Uses the Gamma API's leaderboard endpoint.
+        Fetch top wallet addresses from the Polymarket Data API leaderboard.
+        Endpoint: GET https://data-api.polymarket.com/v1/leaderboard
         """
-        url = f"{settings.gamma_api_url}/leaderboard"
-        params: dict[str, Any] = {"limit": limit}
+        addresses: list[str] = []
+        offset = 0
+        page_size = min(limit, 50)
 
-        try:
-            data = await self._request("GET", url, params=params)
-        except Exception:
-            logger.warning("Leaderboard scrape failed, returning empty list")
-            return []
+        while len(addresses) < limit:
+            url = f"{settings.data_api_url}/v1/leaderboard"
+            params: dict[str, Any] = {
+                "limit": page_size,
+                "offset": offset,
+                "timePeriod": time_period,
+                "orderBy": order_by,
+            }
 
-        if not isinstance(data, list):
-            data = data.get("data", data.get("leaderboard", []))
+            try:
+                data = await self._request("GET", url, params=params)
+            except Exception as exc:
+                logger.warning("Leaderboard fetch failed at offset {}: {}", offset, exc)
+                break
 
-        return [
-            entry.get("address", entry.get("user", "")).lower()
-            for entry in data
-            if entry.get("address") or entry.get("user")
-        ]
+            if not isinstance(data, list):
+                data = data.get("data", data.get("leaderboard", []))
+
+            if not data:
+                break
+
+            for entry in data:
+                addr = (
+                    entry.get("proxyWallet", "")
+                    or entry.get("address", "")
+                    or entry.get("user", "")
+                )
+                if addr:
+                    addresses.append(addr.lower())
+
+            if len(data) < page_size:
+                break
+            offset += page_size
+
+        logger.info("Leaderboard: fetched {} wallet addresses", len(addresses))
+        return addresses[:limit]
