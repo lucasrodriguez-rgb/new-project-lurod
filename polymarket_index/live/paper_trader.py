@@ -43,14 +43,14 @@ class LivePaperTrader:
     def __init__(
         self,
         num_wallets: int = 500,
-        top_n_copy: int = 50,
+        top_n_copy: int = 100,
         initial_capital: float = 10_000.0,
-        poll_interval: int = 30,
+        poll_interval: int = 15,
         duration_hours: float = 24.0,
         base_trade_pct: float = 0.01,
-        min_price: float = 0.10,
-        max_price: float = 0.92,
-        min_wallet_score: float = 55.0,
+        min_price: float = 0.03,
+        max_price: float = 0.98,
+        min_wallet_score: float = 30.0,
         resume: bool = False,
     ) -> None:
         self._api = PolymarketClient()
@@ -114,30 +114,51 @@ class LivePaperTrader:
             await self._api.close()
 
     async def _initialize(self) -> None:
-        logger.info("Fetching top {} wallets from leaderboard...", self._num_wallets)
+        logger.info("Discovering active wallets from multiple leaderboard categories...")
 
-        self._wallet_addresses = await self._api.scrape_leaderboard(
-            limit=self._num_wallets, order_by="PNL"
-        )
-        logger.info("Got {} wallet addresses", len(self._wallet_addresses))
+        all_addresses: set[str] = set()
+        for period in ("DAY", "WEEK", "MONTH", "ALL"):
+            for order_by in ("PNL", "VOL"):
+                try:
+                    batch = await self._api.scrape_leaderboard(
+                        limit=min(self._num_wallets, 50),
+                        time_period=period,
+                        order_by=order_by,
+                    )
+                    all_addresses.update(batch)
+                    logger.info("  {}/{}: {} wallets", period, order_by, len(batch))
+                except Exception as exc:
+                    logger.debug("Leaderboard {}/{} failed: {}", period, order_by, exc)
+
+        if len(all_addresses) < self._num_wallets:
+            try:
+                extra = await self._api.scrape_leaderboard(
+                    limit=self._num_wallets, order_by="PNL"
+                )
+                all_addresses.update(extra)
+            except Exception:
+                pass
+
+        self._wallet_addresses = list(all_addresses)
+        logger.info("Total unique wallets discovered: {}", len(self._wallet_addresses))
 
         if not self._wallet_addresses:
             raise RuntimeError("No wallets found on leaderboard")
 
-        logger.info("Loading initial trade history for scoring...")
-        sem = asyncio.Semaphore(5)
+        logger.info("Loading recent trades for scoring (keeping seen window small)...")
+        sem = asyncio.Semaphore(8)
         loaded = 0
 
         async def _load(addr: str) -> None:
             nonlocal loaded
             async with sem:
                 try:
-                    trades = await self._api.get_trades(addr, limit=200, offset=0)
+                    trades = await self._api.get_trades(addr, limit=100, offset=0)
                     self._wallet_trades[addr] = [self._trade_to_dict(t) for t in trades]
-                    for t in trades:
-                        tx = t.id
-                        if tx:
-                            self._seen_tx_hashes.add(tx)
+                    # Only mark the LAST 3 trades as seen — everything else can trigger copies
+                    for t in trades[:3]:
+                        if t.id:
+                            self._seen_tx_hashes.add(t.id)
                     loaded += 1
                     if loaded % 50 == 0:
                         logger.info("  loaded {}/{} wallets...", loaded, len(self._wallet_addresses))
@@ -145,7 +166,7 @@ class LivePaperTrader:
                     logger.debug("Failed to load {}: {}", addr[:10], exc)
 
         await asyncio.gather(*[_load(a) for a in self._wallet_addresses])
-        logger.info("Loaded trade history for {} wallets ({} known trades)",
+        logger.info("Loaded {} wallets ({} seen hashes — kept small for more signals)",
                      len(self._wallet_trades), len(self._seen_tx_hashes))
 
         self._score_all_wallets()
@@ -156,46 +177,46 @@ class LivePaperTrader:
                          i + 1, w["address"][:12], w["score"],
                          w["roi"], w["win_rate"], w["trade_count"])
 
-        logger.info("Initialization complete — starting live polling")
+        logger.info("Initialization complete — polling ALL {} wallets every {}s",
+                     len(self._wallet_addresses), self._poll_interval)
 
     async def _poll_cycle(self) -> None:
-        top_wallets = sorted(
+        all_scored = sorted(
             self._wallet_scores.values(),
             key=lambda w: w["score"],
             reverse=True,
-        )[:self._top_n]
+        )
+        rank_map = {w["address"]: i + 1 for i, w in enumerate(all_scored)}
 
-        if not top_wallets:
-            return
+        # Poll ALL tracked wallets, not just top N
+        poll_addrs = self._wallet_addresses
 
-        top_addrs = [w["address"] for w in top_wallets]
-        rank_map = {w["address"]: i + 1 for i, w in enumerate(top_wallets)}
-
-        sem = asyncio.Semaphore(8)
+        sem = asyncio.Semaphore(10)
         new_trades: list[tuple[str, TradeRecord, int]] = []
 
         async def _check(addr: str) -> None:
             async with sem:
                 try:
-                    recent = await self._api.get_trades(addr, limit=10, offset=0)
+                    recent = await self._api.get_trades(addr, limit=5, offset=0)
                     for t in recent:
                         if t.id and t.id not in self._seen_tx_hashes:
                             self._seen_tx_hashes.add(t.id)
-                            new_trades.append((addr, t, rank_map.get(addr, 999)))
+                            rank = rank_map.get(addr, len(all_scored))
+                            new_trades.append((addr, t, rank))
 
                             if addr in self._wallet_trades:
                                 self._wallet_trades[addr].insert(0, self._trade_to_dict(t))
                 except Exception:
                     pass
 
-        await asyncio.gather(*[_check(a) for a in top_addrs])
+        await asyncio.gather(*[_check(a) for a in poll_addrs])
 
         for wallet_addr, trade, rank in new_trades:
             await self._process_signal(wallet_addr, trade, rank)
 
         await self._update_open_positions()
 
-        if self._cycle_count % 20 == 0:
+        if self._cycle_count % 60 == 0:
             self._score_all_wallets()
 
     async def _process_signal(
@@ -226,14 +247,16 @@ class LivePaperTrader:
             return
 
         trade_pct = self._base_trade_pct
-        if rank <= 10:
-            trade_pct *= 1.5
-        if rank <= 3:
+        if rank <= 5:
+            trade_pct *= 3.0
+        elif rank <= 15:
+            trade_pct *= 2.0
+        elif rank <= 30:
             trade_pct *= 1.5
 
         copy_size = self._portfolio.total_value * trade_pct
-        copy_size = min(copy_size, self._portfolio.cash * 0.25)
-        copy_size = max(copy_size, 5.0)
+        copy_size = min(copy_size, self._portfolio.cash * 0.15)
+        copy_size = max(copy_size, 2.0)
 
         pos = self._portfolio.open_position(
             market_id=trade.market_id,
@@ -253,27 +276,22 @@ class LivePaperTrader:
             )
 
     def _validate_signal(self, trade: TradeRecord, rank: int) -> str:
-        if trade.price < self._min_price:
-            return f"price too low ({trade.price:.3f} < {self._min_price})"
-        if trade.price > self._max_price:
-            return f"price too high ({trade.price:.3f} > {self._max_price})"
+        if trade.price <= 0.02:
+            return f"price too low ({trade.price:.3f})"
+        if trade.price >= 0.99:
+            return f"price too high ({trade.price:.3f})"
 
-        score = self._wallet_scores.get(
-            next((a for a in self._wallet_addresses if a.startswith(trade.id[:10])), ""),
-            {},
-        ).get("score", 0)
-
-        same_market = sum(
+        same_market_same_side = sum(
             1 for p in self._portfolio.open_positions
-            if p.market_id == trade.market_id
+            if p.market_id == trade.market_id and p.side == trade.side
         )
-        if same_market >= 3:
-            return f"crowded ({same_market} positions on same market)"
+        if same_market_same_side >= 5:
+            return f"already have {same_market_same_side} same-side positions"
 
-        if len(self._portfolio.open_positions) >= 50:
-            return "max open positions (50)"
+        if len(self._portfolio.open_positions) >= 200:
+            return "max open positions (200)"
 
-        if self._portfolio.cash < 5.0:
+        if self._portfolio.cash < 2.0:
             return "insufficient cash"
 
         return ""
