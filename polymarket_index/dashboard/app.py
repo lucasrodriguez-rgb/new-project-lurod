@@ -22,8 +22,15 @@ from polymarket_index.edge.trade_db import TradeDB
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(title="Polymarket Index Dashboard", version="1.0.0")
-db = TradeDB()
 connected_clients: list[WebSocket] = []
+_db: TradeDB | None = None
+
+
+def get_db() -> TradeDB:
+    global _db
+    if _db is None:
+        _db = TradeDB()
+    return _db
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -36,18 +43,20 @@ async def index():
 
 @app.get("/api/status")
 async def api_status():
-    stats = db.get_stats()
+    stats = get_db().get_stats()
     paper_data = _load_paper_portfolio()
-    return {
+    result = {
         "edge_trader": stats,
         "paper_trader": paper_data,
         "timestamp": time.time(),
     }
+    _sanitize_floats(result)
+    return result
 
 
 @app.get("/api/pnl")
 async def api_pnl():
-    history = db.get_pnl_history(500)
+    history = get_db().get_pnl_history(500)
     paper_data = _load_paper_portfolio()
     return {
         "edge_pnl_history": history,
@@ -61,7 +70,7 @@ async def api_pnl():
 
 @app.get("/api/positions")
 async def api_positions():
-    open_trades = db.get_open_trades()
+    open_trades = get_db().get_open_trades()
     paper_data = _load_paper_portfolio()
     return {
         "edge_positions": [
@@ -82,7 +91,7 @@ async def api_positions():
 
 @app.get("/api/trades")
 async def api_trades():
-    recent = db.get_recent_trades(100)
+    recent = get_db().get_recent_trades(100)
     return {
         "trades": [
             {
@@ -126,7 +135,7 @@ async def websocket_endpoint(ws: WebSocket):
     connected_clients.append(ws)
     try:
         while True:
-            stats = db.get_stats()
+            stats = get_db().get_stats()
             paper_data = _load_paper_portfolio()
             payload = {
                 "type": "update",
@@ -155,10 +164,29 @@ def _load_paper_portfolio() -> dict:
     path = Path("live_paper_trading.json")
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            data = json.loads(path.read_text())
+            _sanitize_floats(data)
+            return data
         except Exception:
             pass
     return {}
+
+
+def _sanitize_floats(obj):
+    """Replace inf/nan with 0 to prevent JSON serialization errors."""
+    import math
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+                obj[k] = 0.0
+            elif isinstance(v, (dict, list)):
+                _sanitize_floats(v)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, float) and (math.isinf(v) or math.isnan(v)):
+                obj[i] = 0.0
+            elif isinstance(v, (dict, list)):
+                _sanitize_floats(v)
 
 
 def start_server(host: str = "0.0.0.0", port: int = 8050):

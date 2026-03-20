@@ -110,7 +110,7 @@ class PaperPortfolio:
     def profit_factor(self) -> float:
         gross_win = sum(p.pnl for p in self.closed_positions if p.pnl > 0)
         gross_loss = abs(sum(p.pnl for p in self.closed_positions if p.pnl < 0))
-        return gross_win / gross_loss if gross_loss > 0 else float("inf")
+        return gross_win / gross_loss if gross_loss > 0 else 0.0
 
     def open_position(
         self,
