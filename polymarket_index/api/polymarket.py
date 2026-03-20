@@ -164,6 +164,14 @@ class PolymarketClient:
                         await asyncio.sleep(wait)
                         continue
 
+                    if 400 <= resp.status < 500 and resp.status != 429:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=resp.status,
+                            message=f"{resp.status} {resp.reason}",
+                        )
+
                     resp.raise_for_status()
                     return await resp.json()
 
@@ -260,30 +268,41 @@ class PolymarketClient:
         return all_markets
 
     async def get_market_by_id(self, market_id: str) -> Market | None:
-        url = f"{settings.gamma_api_url}/markets/{market_id}"
+        """
+        Try multiple methods to look up a market:
+        1. Gamma API by slug (if market_id looks like a slug)
+        2. Gamma API markets list with condition_id filter
+        """
+        # Try Gamma API with condition_id as query param
+        url = f"{settings.gamma_api_url}/markets"
         try:
-            m = await self._request("GET", url)
-        except Exception:
-            return None
-
-        outcome_prices: dict[str, float] = {}
-        for token in m.get("tokens", []):
-            outcome_prices[token.get("outcome", "unknown")] = float(
-                token.get("price", 0)
+            data = await self._request(
+                "GET", url, params={"condition_id": market_id, "limit": 1}
             )
+            items = data if isinstance(data, list) else data.get("data", [])
+            if items:
+                m = items[0]
+                outcome_prices: dict[str, float] = {}
+                for token in m.get("tokens", []):
+                    outcome_prices[token.get("outcome", "unknown")] = float(
+                        token.get("price", 0)
+                    )
+                return Market(
+                    id=str(m.get("condition_id", m.get("id", ""))),
+                    question=m.get("question", ""),
+                    slug=m.get("slug", ""),
+                    active=m.get("active", False),
+                    closed=m.get("closed", False),
+                    volume=float(m.get("volume", 0)),
+                    liquidity=float(m.get("liquidity", 0)),
+                    close_time=m.get("end_date_iso") or m.get("close_time"),
+                    outcome_prices=outcome_prices,
+                    category=m.get("category", ""),
+                )
+        except Exception:
+            pass
 
-        return Market(
-            id=str(m.get("condition_id", m.get("id", ""))),
-            question=m.get("question", ""),
-            slug=m.get("slug", ""),
-            active=m.get("active", False),
-            closed=m.get("closed", False),
-            volume=float(m.get("volume", 0)),
-            liquidity=float(m.get("liquidity", 0)),
-            close_time=m.get("end_date_iso") or m.get("close_time"),
-            outcome_prices=outcome_prices,
-            category=m.get("category", ""),
-        )
+        return None
 
     # ── Data API: Positions ─────────────────────────────────────────────
 

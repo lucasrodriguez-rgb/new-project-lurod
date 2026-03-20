@@ -17,4 +17,5 @@ env/
 backtest_data/
 backtest_results.json
 equity_curve.csv
+live_paper_trading.json
 logs/

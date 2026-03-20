@@ -35,6 +35,9 @@ polymarket_index/
 │   ├── data_collector.py        # Fetch + cache historical data from Gamma API
 │   ├── engine.py                # Walk-forward backtest engine
 │   └── runner.py                # CLI entry point with result reporting
+├── live/
+│   ├── paper_portfolio.py       # Virtual portfolio with P&L tracking
+│   └── paper_trader.py          # Real-time paper trading engine + dashboard
 ├── db/
 │   ├── models.py                # SQLAlchemy async models (5 tables)
 │   └── queries.py               # Typed query functions
@@ -74,6 +77,33 @@ Raw signals must pass all 7 checks:
 | Price staleness | Within 5% of current order book mid |
 | Crowding | < 3 top wallets already hold the same position |
 | Wallet tenure | Wallet has been in index > 48 hours |
+
+## Live Paper Trading
+
+Run a real-time simulation that tracks top wallets and copies their trades into a virtual portfolio — no API keys needed:
+
+```bash
+# Track top 500 wallets for 24 hours
+python3 -m polymarket_index.live --wallets 500 --duration 24
+
+# Aggressive mode: $50k capital, bigger positions, faster polling
+python3 -m polymarket_index.live --wallets 500 --capital 50000 --trade-pct 0.02 --poll 15
+
+# Resume a previous session
+python3 -m polymarket_index.live --resume
+
+# Quick test: 100 wallets, 1 hour
+python3 -m polymarket_index.live --wallets 100 --duration 1
+```
+
+The paper trader:
+- Fetches the top N wallets from the Polymarket leaderboard
+- Scores each wallet on ROI, Sharpe, win rate, volume, and diversity
+- Polls for new trades every 30s (configurable)
+- Copies trades from top-scored wallets with dynamic position sizing
+- Resolves positions when markets close
+- Prints a live dashboard with P&L, open positions, win rate, and recent signals
+- Saves state to `live_paper_trading.json` every cycle (auto-resumes on restart)
 
 ## Backtesting
 
